@@ -1,0 +1,9 @@
+float64 waypoint_spacing
+float64 total_length
+float64 turn_radius
+string trajectory_type
+---
+float64[] x
+float64[] y
+float64[] yaw
+float64[] kappa
