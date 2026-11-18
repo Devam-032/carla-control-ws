@@ -7,10 +7,13 @@ import csv
 import os
 import time
 
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import String
 from carla_msgs.msg import CarlaEgoVehicleControl
 from carla_control_interfaces.srv import GenerateTrajectory
 from tf_transformations import euler_from_quaternion
+
+from carla_control.command_interface import parse_command
 
 
 def wrap_angle(a):
@@ -30,12 +33,22 @@ class StanleyController(Node):
         self.declare_parameter("total_length", 100.0)
         self.declare_parameter("turn_radius", 5.0)
         self.declare_parameter("v_ref", 10.0)
+        self.declare_parameter("wait_for_command", False)
+        # "service": fixed synthetic trajectory from /generate_trajectory
+        # "road":    live lane-following path from the road_reference node
+        self.declare_parameter("reference_source", "service")
 
+        self.reference_source = self.get_parameter("reference_source").value
         self.trajectory_type = self.get_parameter("trajectory_type").value
         self.waypoint_spacing = self.get_parameter("waypoint_spacing").value
         self.total_length = self.get_parameter("total_length").value
         self.turn_radius = self.get_parameter("turn_radius").value
         self.v_ref = self.get_parameter("v_ref").value
+
+        # Command mode: idle until a 'go' arrives on ~/command,
+        # and stay alive after the goal instead of shutting down
+        self.command_mode = self.get_parameter("wait_for_command").value
+        self.armed = not self.command_mode
 
         # ======================================================
         # STANLEY GAINS
@@ -73,29 +86,13 @@ class StanleyController(Node):
         # ======================================================
         # LOGGING
         # ======================================================
-        log_dir = os.path.expanduser("~/stanley_logs")
-        os.makedirs(log_dir, exist_ok=True)
+        self.log_dir = os.path.expanduser("~/stanley_logs")
+        os.makedirs(self.log_dir, exist_ok=True)
 
-        self.ego_log = open(os.path.join(log_dir, "ego_path.csv"), "w", newline="")
-        self.ego_writer = csv.writer(self.ego_log)
-
-        # CSV HEADER (self-describing)
-        self.ego_writer.writerow([
-            "time",
-            "x",
-            "y",
-            "yaw",
-            "ego_speed",
-            "cte",
-            "heading_error",
-            "steer",
-            "k_ct",
-            "k_heading"
-        ])
-
-        self.ref_log = open(os.path.join(log_dir, "reference_trajectory.csv"), "w", newline="")
-        self.ref_writer = csv.writer(self.ref_log)
-        self.ref_writer.writerow(["x", "y", "yaw"])
+        self.ego_log = None
+        self.ref_log = None
+        if not self.command_mode:
+            self.open_logs("")
 
         # ======================================================
         # ROS INTERFACES
@@ -113,6 +110,16 @@ class StanleyController(Node):
             10
         )
 
+        self.create_subscription(String, "~/command", self.command_cb, 10)
+
+        if self.reference_source == "road":
+            self.create_subscription(
+                Path,
+                "/carla/ego_vehicle/road_reference",
+                self.road_path_cb,
+                10
+            )
+
         self.traj_client = self.create_client(
             GenerateTrajectory,
             "/generate_trajectory"
@@ -123,13 +130,98 @@ class StanleyController(Node):
         self.get_logger().info(
             f"Stanley controller started | k_ct={self.k_ct}, k_heading={self.k_heading}"
         )
+        if self.command_mode:
+            self.get_logger().info(
+                f"Waiting for commands on {self.resolve_topic_name('~/command')}"
+            )
+
+    # ======================================================
+    # LOGGING
+    # ======================================================
+    def open_logs(self, prefix):
+        """prefix '' keeps the original ego_path.csv / reference_trajectory.csv names."""
+        for f in (self.ego_log, self.ref_log):
+            if f is not None:
+                f.close()
+
+        self.ego_log = open(os.path.join(self.log_dir, f"{prefix}ego_path.csv"), "w", newline="")
+        self.ego_writer = csv.writer(self.ego_log)
+
+        # CSV HEADER (self-describing)
+        self.ego_writer.writerow([
+            "time",
+            "x",
+            "y",
+            "yaw",
+            "ego_speed",
+            "cte",
+            "heading_error",
+            "steer",
+            "k_ct",
+            "k_heading"
+        ])
+
+        self.ref_log = open(os.path.join(self.log_dir, f"{prefix}reference_trajectory.csv"), "w", newline="")
+        self.ref_writer = csv.writer(self.ref_log)
+        self.ref_writer.writerow(["x", "y", "yaw"])
+
+    # ======================================================
+    # ON-THE-FLY COMMANDS
+    # ======================================================
+    def command_cb(self, msg):
+
+        try:
+            verb, updates = parse_command(msg.data)
+        except ValueError as e:
+            self.get_logger().warn(f"Bad command '{msg.data}': {e}")
+            return
+
+        for attr, val in updates.items():
+            setattr(self, attr, val)
+
+        if verb == "stop":
+            self.halt()
+            self.get_logger().info("STOP: braking, waiting for next 'go'")
+
+        elif verb == "speed":
+            self.get_logger().info(f"v_ref -> {self.v_ref:.2f} m/s")
+
+        elif verb == "go":
+            self.halt()
+            # Fresh log pair per run so runs never overwrite each other
+            self.open_logs(time.strftime("run_%Y%m%d_%H%M%S_"))
+            self.goal_reached = False
+            self.prev_steer = 0.0
+            self.armed = True
+            self.get_logger().info(
+                f"GO: {self.trajectory_type} | L={self.total_length} R={self.turn_radius} "
+                f"v_ref={self.v_ref} ds={self.waypoint_spacing} (planned from current pose)"
+            )
+
+    def halt(self):
+        """Stop tracking, drop the current trajectory and brake."""
+        if self.control_timer is not None:
+            self.control_timer.cancel()
+            self.control_timer = None
+        self.armed = False
+        self.traj_received = False
+        self.initialized = False
+        self.traj_world = None
+        self.publish_brake()
+
+    def publish_brake(self):
+        cmd = CarlaEgoVehicleControl()
+        cmd.throttle = 0.0
+        cmd.brake = 1.0
+        cmd.steer = 0.0
+        self.ctrl_pub.publish(cmd)
 
     # ======================================================
     # TRAJECTORY REQUEST
     # ======================================================
     def request_trajectory(self):
 
-        if self.traj_received:
+        if self.traj_received or not self.armed or self.reference_source == "road":
             return
 
         if not self.traj_client.service_is_ready():
@@ -147,13 +239,33 @@ class StanleyController(Node):
     def on_traj_response(self, future):
 
         resp = future.result()
-        if resp is None or len(resp.x) == 0:
+        if resp is None or len(resp.x) == 0 or not self.armed:
             return
 
         self.traj_local = np.column_stack((resp.x, resp.y, resp.yaw))
         self.traj_received = True
 
         self.get_logger().info(f"Trajectory received ({len(self.traj_local)} points)")
+
+    # ======================================================
+    # LIVE ROAD REFERENCE (already in WORLD frame)
+    # ======================================================
+    def road_path_cb(self, msg):
+
+        if not self.armed or len(msg.poses) < 2:
+            return
+
+        pts = []
+        for ps in msg.poses:
+            q = ps.pose.orientation
+            _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+            pts.append((ps.pose.position.x, ps.pose.position.y, yaw))
+        self.traj_world = np.array(pts)
+
+        if not self.initialized:
+            self.control_timer = self.create_timer(self.dt, self.control_loop)
+            self.initialized = True
+            self.get_logger().info("Controller initialized (road reference)")
 
     # ======================================================
     # BUILD WORLD TRAJECTORY
@@ -205,7 +317,7 @@ class StanleyController(Node):
     # ======================================================
     def control_loop(self):
 
-        if self.goal_reached or self.ego_pose is None:
+        if self.goal_reached or self.ego_pose is None or self.traj_world is None:
             return
 
         x, y, yaw = self.ego_pose
@@ -217,14 +329,19 @@ class StanleyController(Node):
         idx = np.argmin(d)
 
         gx, gy, _ = self.traj_world[-1]
-        if idx >= len(self.traj_world) - 2 and np.hypot(gx - x, gy - y) < self.goal_tol:
+        # A rolling road path has no fixed goal; drive until 'stop'
+        if (self.reference_source != "road"
+                and idx >= len(self.traj_world) - 2
+                and np.hypot(gx - x, gy - y) < self.goal_tol):
             self.goal_reached = True
 
-            cmd = CarlaEgoVehicleControl()
-            cmd.throttle = 0.0
-            cmd.brake = 1.0
-            cmd.steer = 0.0
-            self.ctrl_pub.publish(cmd)
+            if self.command_mode:
+                self.halt()
+                self.ego_log.flush()
+                self.get_logger().info("Goal reached, waiting for next 'go'")
+                return
+
+            self.publish_brake()
 
             self.control_timer.cancel()
             self.request_shutdown = True

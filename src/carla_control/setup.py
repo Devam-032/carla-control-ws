@@ -41,6 +41,7 @@ setup(
             'stanley_controller = carla_control.stanley_controller:main',
             'trajectory_service = carla_control.trajectory_service:main',
             'lqr_controller = carla_control.lqr_controller:main',
+            'road_reference = carla_control.road_reference:main',
         ],
     },
 )

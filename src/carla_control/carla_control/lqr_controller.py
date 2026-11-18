@@ -7,11 +7,14 @@ import csv
 import os
 import time
 
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import String
 from carla_msgs.msg import CarlaEgoVehicleControl
 from carla_control_interfaces.srv import GenerateTrajectory
 from tf_transformations import euler_from_quaternion
 from control.matlab import dare
+
+from carla_control.command_interface import parse_command
 
 
 def wrap_angle(a):
@@ -54,12 +57,21 @@ class RoarLQRController(Node):
         self.declare_parameter("total_length", 100.0)
         self.declare_parameter("turn_radius", 10.0)
         self.declare_parameter("v_ref", 4.0)
+        self.declare_parameter("wait_for_command", False)
+        # "service": fixed synthetic trajectory from /generate_trajectory
+        # "road":    live lane-following path from the road_reference node
+        self.declare_parameter("reference_source", "service")
 
+        self.reference_source = self.get_parameter("reference_source").value
         self.trajectory_type = self.get_parameter("trajectory_type").value
         self.waypoint_spacing = self.get_parameter("waypoint_spacing").value
         self.total_length = self.get_parameter("total_length").value
         self.turn_radius = self.get_parameter("turn_radius").value
         self.v_ref = self.get_parameter("v_ref").value
+
+        # Command mode: idle until a 'go' arrives on ~/command
+        self.command_mode = self.get_parameter("wait_for_command").value
+        self.armed = not self.command_mode
 
         # ==================================================
         # Vehicle parameters
@@ -113,16 +125,13 @@ class RoarLQRController(Node):
         # ==================================================
         # Logging
         # ==================================================
-        log_dir = os.path.expanduser("~/roar_lqr_logs")
-        os.makedirs(log_dir, exist_ok=True)
+        self.log_dir = os.path.expanduser("~/roar_lqr_logs")
+        os.makedirs(self.log_dir, exist_ok=True)
 
-        self.log = open(os.path.join(log_dir, "ego_path.csv"), "w", newline="")
-        self.writer = csv.writer(self.log)
-        self.writer.writerow([
-            "time", "x", "y", "ref_x", "ref_y",
-            "ey", "epsi", "vy", "r", "steer",
-            "delta_ff", "delta_fb"
-        ])
+        self.log = None
+        self.control_timer = None
+        if not self.command_mode:
+            self.open_log("")
 
         # ==================================================
         # ROS interfaces
@@ -145,15 +154,92 @@ class RoarLQRController(Node):
             "/generate_trajectory"
         )
 
+        self.create_subscription(String, "~/command", self.command_cb, 10)
+
+        if self.reference_source == "road":
+            self.create_subscription(
+                Path,
+                "/carla/ego_vehicle/road_reference",
+                self.road_path_cb,
+                10
+            )
+
         self.create_timer(0.5, self.request_trajectory)
 
         self.get_logger().info("ROAR Dynamic Bicycle LQR started")
+        if self.command_mode:
+            self.get_logger().info(
+                f"Waiting for commands on {self.resolve_topic_name('~/command')}"
+            )
+
+    # ==================================================
+    # Logging
+    # ==================================================
+    def open_log(self, prefix):
+        """prefix '' keeps the original ego_path.csv name."""
+        if self.log is not None:
+            self.log.close()
+
+        self.log = open(os.path.join(self.log_dir, f"{prefix}ego_path.csv"), "w", newline="")
+        self.writer = csv.writer(self.log)
+        self.writer.writerow([
+            "time", "x", "y", "ref_x", "ref_y",
+            "ey", "epsi", "vy", "r", "steer",
+            "delta_ff", "delta_fb"
+        ])
+
+    # ==================================================
+    # On-the-fly commands
+    # ==================================================
+    def command_cb(self, msg):
+        try:
+            verb, updates = parse_command(msg.data)
+        except ValueError as e:
+            self.get_logger().warn(f"Bad command '{msg.data}': {e}")
+            return
+
+        for attr, val in updates.items():
+            setattr(self, attr, val)
+
+        if verb == "stop":
+            self.halt()
+            self.get_logger().info("STOP: braking, waiting for next 'go'")
+
+        elif verb == "speed":
+            self.get_logger().info(f"v_ref -> {self.v_ref:.2f} m/s")
+
+        elif verb == "go":
+            self.halt()
+            # Fresh log per run so runs never overwrite each other
+            self.open_log(time.strftime("run_%Y%m%d_%H%M%S_"))
+            self.control_active = True
+            self.armed = True
+            self.get_logger().info(
+                f"GO: {self.reference_source}/{self.trajectory_type} | L={self.total_length} "
+                f"R={self.turn_radius} v_ref={self.v_ref} ds={self.waypoint_spacing}"
+            )
+
+    def halt(self):
+        """Stop tracking, drop the current trajectory and brake."""
+        if self.control_timer is not None:
+            self.control_timer.cancel()
+            self.control_timer = None
+        self.armed = False
+        self.traj_received = False
+        self.initialized = False
+        self.traj_world = None
+        cmd = CarlaEgoVehicleControl()
+        cmd.steer = 0.0
+        cmd.throttle = 0.0
+        cmd.brake = 1.0
+        self.ctrl_pub.publish(cmd)
 
     # ==================================================
     # Trajectory
     # ==================================================
     def request_trajectory(self):
-        if self.traj_received or not self.traj_client.service_is_ready():
+        if (self.traj_received or not self.armed or self.reference_source == "road"
+                or not self.traj_client.service_is_ready()):
             return
 
         req = GenerateTrajectory.Request()
@@ -167,12 +253,29 @@ class RoarLQRController(Node):
 
     def on_traj(self, future):
         resp = future.result()
-        if resp is None:
+        if resp is None or not self.armed:
             return
 
         self.traj_local = np.column_stack((resp.x, resp.y, resp.yaw, resp.kappa))
         self.traj_received = True
         self.get_logger().info(f"Trajectory received ({len(self.traj_local)} points)")
+
+    def road_path_cb(self, msg):
+        """Live road reference, already in the world frame."""
+        if not self.armed or len(msg.poses) < 3:
+            return
+
+        pts = []
+        for ps in msg.poses:
+            q = ps.pose.orientation
+            _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+            pts.append((ps.pose.position.x, ps.pose.position.y, yaw))
+        self.traj_world = np.array(pts)
+
+        if not self.initialized:
+            self.control_timer = self.create_timer(self.dt, self.control_loop)
+            self.initialized = True
+            self.get_logger().info("Controller initialized (road reference)")
 
     def build_world_traj(self):
         x0, y0, yaw0 = self.ego_pose
@@ -245,21 +348,22 @@ class RoarLQRController(Node):
     # Control loop
     # ==================================================
     def control_loop(self):
-        if self.ego_pose is None or not self.control_active:
+        if self.ego_pose is None or not self.control_active or self.traj_world is None:
             return
 
         self.compute_lqr(self.vx)
 
         x, y, yaw = self.ego_pose
 
-        # Shutdown condition
-        if self.check_goal_reached(x, y):
+        # Shutdown condition (a rolling road path has no fixed goal)
+        if self.reference_source != "road" and self.check_goal_reached(x, y):
             cmd = CarlaEgoVehicleControl()
             cmd.steer = 0.0
             cmd.throttle = 0.0
             cmd.brake = 1.0
             self.ctrl_pub.publish(cmd)
             self.control_active = False
+            self.log.flush()
             return
 
         d = np.hypot(self.traj_world[:, 0] - x,
