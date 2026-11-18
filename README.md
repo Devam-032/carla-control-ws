@@ -181,6 +181,83 @@ ros2 run carla_control lqr_controller   --ros-args   -p trajectory_type:=right_t
 
 ---
 
+## Live Road Reference & On-the-Fly Commands
+
+The synthetic trajectories above are generated relative to the start pose and ignore the map,
+so a turn can easily run off the road. Both controllers can instead track a **live road path**:
+
+```
+road_reference node
+  odometry → CARLA map lane waypoints ahead of the car (rolling 40 m horizon, ~5 Hz)
+           → nav_msgs/Path on /carla/ego_vehicle/road_reference
+```
+
+- The map is built client-side from the bridge's latched `/carla/world_info` OpenDRIVE,
+  so the node never opens its own connection to the simulator.
+- Junction behaviour is a live parameter: `straight | left | right | random`.
+
+### Run
+
+```bash
+ros2 run carla_control trajectory_service
+ros2 run carla_control road_reference
+ros2 run carla_control stanley_controller --ros-args -p reference_source:=road -p wait_for_command:=true
+# or: ros2 run carla_control lqr_controller --ros-args -p reference_source:=road -p wait_for_command:=true
+```
+
+### Commands (`std_msgs/String` on `<node>/command`)
+
+| Command | Effect |
+|---|---|
+| `go [type] [L=..] [R=..] [v=..] [ds=..]` | (Re)plan from the **current** pose and start tracking |
+| `speed <m/s>` | Change `v_ref` while driving |
+| `stop` | Brake and hold; node stays alive for the next `go` |
+
+```bash
+ros2 topic pub --once /stanley_controller/command std_msgs/msg/String "{data: 'go v=8'}"
+ros2 param set /road_reference junction_choice left
+ros2 topic pub --once /stanley_controller/command std_msgs/msg/String "{data: 'stop'}"
+```
+
+- `reference_source` defaults to `service` and `wait_for_command` to `false`, so the original
+  workflow above is unchanged.
+- In command mode every `go` writes its own `run_<timestamp>_ego_path.csv`, so runs never
+  overwrite each other.
+- Command topics: `/stanley_controller/command`, `/roar_lqr_controller/command`.
+
+### Result: same road, same start pose, 8 m/s (Town05, right turns at junctions)
+
+| Controller | max \|cross-track error\| | RMS |
+|---|---|---|
+| Stanley | 0.161 m | 0.062 m |
+| LQR (dynamic bicycle + feedforward) | 0.044 m | 0.012 m |
+
+First 10 m excluded (LQR is gated off below 3 m/s, so it does not steer during the
+pull-away). Runs are aligned on distance along the route, since the controllers tick at different rates.
+
+### Reproducing (`tools/sim/`)
+
+```bash
+bash tools/sim/start_stack.sh                    # CARLA → Town05 → bridge (lockstep) → services
+ros2 param set /road_reference junction_choice right
+python3 tools/sim/rec.py start $PWD/tools/sim/recordings/stanley.log
+bash tools/sim/road_run.sh stanley 45 8          # same start pose for both controllers
+python3 tools/sim/rec.py stop
+# ...repeat for lqr...
+python3 tools/sim/build_comparison.py stanley-vs-lqr.csv
+bash tools/sim/stop_ros.sh                       # keep CARLA, stop ROS side
+python3 tools/sim/replay_cam.py tools/sim/recordings/stanley.log <ego_id> tools/sim/frames/stanley
+bash tools/sim/kill_stack.sh                     # stop everything
+```
+
+Stability notes (CARLA 0.9.14): streaming a chase camera to `carla_manual_control` made the server
+segfault within a minute or two, so the stack spawns the ego with odometry/control only and renders
+video afterwards from a CARLA recording (`replay_cam.py`, fixed 1/30 s step → true-speed video).
+The bridge runs in lockstep (`synchronous_mode_wait_for_vehicle_control_command`), so the simulation
+advances one tick per control command.
+
+---
+
 ## Logging & Analysis
 
 Both controllers log:

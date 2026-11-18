@@ -1,0 +1,26 @@
+{
+  "objects": [
+    {
+      "type": "vehicle.tesla.model3",
+      "id": "ego_vehicle",
+      "sensors": [
+        {
+          "type": "sensor.pseudo.tf",
+          "id": "tf"
+        },
+        {
+          "type": "sensor.pseudo.odom",
+          "id": "odometry"
+        },
+        {
+          "type": "sensor.pseudo.speedometer",
+          "id": "speedometer"
+        },
+        {
+          "type": "actor.pseudo.control",
+          "id": "control"
+        }
+      ]
+    }
+  ]
+}
