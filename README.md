@@ -233,7 +233,9 @@ ros2 topic pub --once /stanley_controller/command std_msgs/msg/String "{data: 's
 | LQR (dynamic bicycle + feedforward) | 0.044 m | 0.012 m |
 
 First 10 m excluded (LQR is gated off below 3 m/s, so it does not steer during the
-pull-away). Runs are aligned on distance along the route, since the controllers tick at different rates.
+pull-away). Data: [`results/stanley-vs-lqr.csv`](results/stanley-vs-lqr.csv)
+(628 rows, 0.5 m bins over 314 m; columns `s_m, speed_stanley_mps, cte_stanley_m, cte_lqr_m,
+heading_err_*, steer_*`). Runs are aligned on distance along the route, since the controllers tick at different rates.
 
 ### Reproducing (`tools/sim/`)
 
